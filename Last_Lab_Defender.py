@@ -29,6 +29,7 @@ class Last_Lab_Defender:
         self.capsule_position  = [self.floor_left_max - 260, self.floor_front_max - 260, 10]
         self.capsule_base_position = [self.floor_left_max - 260, self.floor_front_max - 260, 0]
         self.capsule_base_height = 10
+        self.capsule_health = 10
 
         # protagonist informations
         self.player_angle = 0
@@ -55,7 +56,7 @@ class Last_Lab_Defender:
         self.enemies = []
         
         # SLOWER ENEMY SPEED
-        self.enemy_speed = 0.25 
+        self.enemy_speed = 0.75 
         
         # Increased Enemy Size
         self.enemy_body_radius = 35 
@@ -383,7 +384,8 @@ class Last_Lab_Defender:
                         'type': 'normal',
                         'body_r': self.enemy_body_radius,
                         'head_r': self.enemy_head_radius,
-                        'color': (0.0, 1.0, 0.0)
+                        # Teal/Ocean Blue: hex #007D8C → normalized floats
+                        'color': (0.0, 125/255.0, 140/255.0)
                     })
                     
             if self.normal_enemies_killed >= 20:
@@ -405,6 +407,7 @@ class Last_Lab_Defender:
 
     def enemy_movement(self):
         target_x, target_y, _ = self.capsule_position
+        player_x, player_y, _ = self.player_spawn_position
         enemies_to_remove = []
         
         for e_idx, enemy in enumerate(self.enemies):
@@ -415,8 +418,20 @@ class Last_Lab_Defender:
             # Cylinder Collision Detection: Vanish if touching the cylinder
             if distance < (self.capsule_radius + enemy['body_r']):
                 enemies_to_remove.append(e_idx)
+                self.capsule_health = max(0, self.capsule_health - 1)
+                print(f"Capsule hit! Remaining health: {self.capsule_health}")
                 continue # Skip moving this enemy as it's being removed
             
+            # Player Collisioon Detection: Vanish if touching the player
+            dx_p = player_x - enemy['x']
+            dy_p = player_y - enemy['y']
+            distance_p = math.sqrt(dx_p**2 + dy_p**2)
+            if distance_p < (self.player_width + enemy['body_r']):
+                enemies_to_remove.append(e_idx)
+                self.player_health = max(0, self.player_health - 1)
+                print(f"Player hit! Remaining health: {self.player_health}")
+                continue # Skip moving this enemy as it's being removed
+
             # Normalize vector and move enemy towards the capsule
             if distance > 0:
                 enemy['x'] += (dx / distance) * self.enemy_speed
@@ -427,7 +442,7 @@ class Last_Lab_Defender:
                 bounce_height = abs(math.sin(enemy['run_cycle'])) * 15
                 enemy['z'] = enemy['base_z'] + bounce_height
                 
-        # Safely remove enemies that hit the cylinder
+        # Safely remove enemies that hit the cylinder or player
         for i in sorted(enemies_to_remove, reverse=True):
             if i < len(self.enemies):
                 self.enemies.pop(i)
@@ -452,11 +467,12 @@ class Last_Lab_Defender:
                     enemies_to_remove.append(e_idx)
                     
                     if enemy['type'] == 'special':
-                        self.player_health += 1
-                        print(f"Special Enemy Killed! Health increased to {self.player_health}")
+                        if self.player_health < 5:
+                            self.player_health += 1
+                            print(f"Special Enemy Killed! Health increased to {self.player_health}")
                     else:
                         self.normal_enemies_killed += 1
-                    break 
+                    break  
 
         for i in sorted(bullets_to_remove, reverse=True):
             if i < len(self.all_bullets):
@@ -470,23 +486,245 @@ class Last_Lab_Defender:
         for enemy in self.enemies:
             ex, ey, ez = enemy['x'], enemy['y'], enemy['z']
             
+            # Unpack color components for reuse across body parts
+            cr, cg, cb = enemy['color']
+            br = enemy['body_r']   # body radius — used as the arm scaling reference
+            hr = enemy['head_r']   # head radius
+
+            # ── Base push: all geometry inherits this translation so
+            #    arms bob up/down with the existing run_cycle animation ──
             glPushMatrix()
             glTranslatef(ex, ey, ez)
-            
-            # Draw Enemy Body (Sphere)
-            glColor3f(enemy['color'][0], enemy['color'][1], enemy['color'][2])
-            gluSphere(gluNewQuadric(), enemy['body_r'], 30, 30)
-            
-            # Draw Enemy Head (Sphere, positioned slightly above the body)
+
+            # ── Body (Sphere) ─────────────────────────────────────────
+            glColor3f(cr, cg, cb)
+            gluSphere(gluNewQuadric(), br, 30, 30)
+
+            # ── Head (Sphere, raised above body) ──────────────────────
             glPushMatrix()
-            glTranslatef(0, 0, enemy['body_r'] + enemy['head_r'] - 5)
-            glColor3f(enemy['color'][0]*0.8, enemy['color'][1]*0.8, enemy['color'][2]*0.8) 
-            gluSphere(gluNewQuadric(), enemy['head_r'], 30, 30)
-            glPopMatrix()
-            
+            glTranslatef(0, 0, br + hr - 5)
+            glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)   # slightly darker shade
+            gluSphere(gluNewQuadric(), hr, 30, 30)
+
+            # --- Head Appendages ---
+            h_base_r = hr * 0.22
+            h_top_r  = 0.01
+            h_height = hr * 0.8
+
+            # Horn 1
+            glPushMatrix()
+            glTranslatef(-hr * 0.5, 0, hr * 0.6)
+            glRotatef(-40, 0, 1, 0)
+            glRotatef(-10, 1, 0, 0)
+            gluCylinder(gluNewQuadric(), h_base_r, h_top_r, h_height, 15, 5)
             glPopMatrix()
 
+            # Horn 2
+            glPushMatrix()
+            glTranslatef(hr * 0.5, 0, hr * 0.6)
+            glRotatef(40, 0, 1, 0)
+            glRotatef(-10, 1, 0, 0)
+            gluCylinder(gluNewQuadric(), h_base_r, h_top_r, h_height, 15, 5)
+            glPopMatrix()
+
+            glPopMatrix()
+
+            # ── Arm geometry parameters (scaled from body radius) ──────
+            # shoulder_offset: how far left/right the shoulder sits from centre
+            shoulder_offset = br * 1.1
+            # shoulder_z: height of the shoulder joint on the body sphere
+            shoulder_z     = br * 0.4
+            # upper-arm length mirrors protagonist's player_leg_height ratio
+            upper_arm_len  = br * 1.1
+            # cylinder radii taper like the protagonist's arm
+            arm_r_top      = br * 0.22   # top (shoulder end) radius
+            arm_r_bot      = br * 0.15   # bottom (elbow end) radius
+            forearm_r_top  = br * 0.18
+            forearm_r_bot  = br * 0.11
+            hand_r         = hr * 0.35   # hand sphere size
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # LEFT ARM  (negative X side, matching protagonist structure)
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            # elbow offset (shared by both arms)
+            elbow_z = -upper_arm_len * 0.65
+            elbow_y = -upper_arm_len * 0.75
+
+            # --- LEFT ARM (negative X side, matching protagonist structure) ---
+
+            # Left shoulder joint sphere
+            glPushMatrix()
+            glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+            glTranslatef(-shoulder_offset, 0, shoulder_z)
+            gluSphere(gluNewQuadric(), arm_r_top * 1.2, 20, 20)
+            glPopMatrix()
+
+            # Left upper-arm cylinder (rotated to hang downward at ~45 deg)
+            glPushMatrix()
+            glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+            glTranslatef(-shoulder_offset, 0, shoulder_z)
+            glRotatef(90, 1, 0, 0)    # point cylinder along -Y (downward)
+            glRotatef(45, 1, 0, 0)    # add 45 deg forward swing (protagonist match)
+            gluCylinder(gluNewQuadric(), arm_r_top, arm_r_bot, upper_arm_len, 20, 5)
+            glPopMatrix()
+
+            # Left forearm
+            glPushMatrix()
+            glColor3f(cr * 0.85, cg * 0.85, cb * 0.85)
+            glTranslatef(-shoulder_offset, elbow_y, elbow_z)
+            glRotatef(90, 1, 0, 0)
+            glRotatef(-25, 1, 0, 0)   # slight outward splay (protagonist match)
+            glRotatef(45, 0, 1, 0)    # lateral twist
+            gluCylinder(gluNewQuadric(), forearm_r_top, forearm_r_bot, upper_arm_len, 20, 5)
+            glPopMatrix()
+
+            # Left hand sphere at the wrist tip
+            glPushMatrix()
+            glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)
+            glTranslatef(-shoulder_offset, elbow_y - upper_arm_len * 0.7, elbow_z - upper_arm_len * 0.5)
+            gluSphere(gluNewQuadric(), hand_r, 20, 20)
+            glPopMatrix()
+
+            # --- RIGHT ARM (positive X side, mirrored) ---
+
+            # Right shoulder joint sphere
+            glPushMatrix()
+            glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+            glTranslatef(shoulder_offset, 0, shoulder_z)
+            gluSphere(gluNewQuadric(), arm_r_top * 1.2, 20, 20)
+            glPopMatrix()
+
+            # Right upper-arm cylinder
+            glPushMatrix()
+            glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+            glTranslatef(shoulder_offset, 0, shoulder_z)
+            glRotatef(90, 1, 0, 0)
+            glRotatef(45, 1, 0, 0)
+            gluCylinder(gluNewQuadric(), arm_r_top, arm_r_bot, upper_arm_len, 20, 5)
+            glPopMatrix()
+
+            # Right forearm
+            glPushMatrix()
+            glColor3f(cr * 0.85, cg * 0.85, cb * 0.85)
+            glTranslatef(shoulder_offset, elbow_y, elbow_z)
+            glRotatef(90, 1, 0, 0)
+            glRotatef(-15, 1, 0, 0)   # slightly different splay (protagonist match)
+            glRotatef(-45, 0, 1, 0)   # mirror lateral twist
+            gluCylinder(gluNewQuadric(), forearm_r_top, forearm_r_bot, upper_arm_len, 20, 5)
+            glPopMatrix()
+
+            # Right hand sphere
+            glPushMatrix()
+            glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)
+            glTranslatef(shoulder_offset, elbow_y - upper_arm_len * 0.7, elbow_z - upper_arm_len * 0.5)
+            gluSphere(gluNewQuadric(), hand_r, 20, 20)
+            glPopMatrix()
+
+            glPopMatrix()  # base enemy transform
+
     # --- END ENEMY METHODS ---
+    def draw_health_bar(self, x, y, width, height, current, maximum, fill_color):
+        # Background bar (Grey) - always visible
+        glColor3f(0.2, 0.2, 0.2)
+        glBegin(GL_QUADS)
+        glVertex3f(x, y, 0)
+        glVertex3f(x + width, y, 0)
+        glVertex3f(x + width, y + height, 0)
+        glVertex3f(x, y + height, 0)
+        glEnd()
+        
+        # Fill (colored) showing remaining health
+        if current > 0:
+            fill_width = width * (min(current, maximum) / maximum)
+            if current < 3:
+                fill_color = (1.0, 0.2, 0.2)
+                glColor3f(fill_color[0], fill_color[1], fill_color[2])
+            elif current < 4:
+                fill_color = (1.0, 0.6, 0.3)
+                glColor3f(fill_color[0], fill_color[1], fill_color[2])
+            else:
+                glColor3f(fill_color[0], fill_color[1], fill_color[2])
+            glBegin(GL_QUADS)
+            glVertex3f(x, y, 0)
+            glVertex3f(x + fill_width, y, 0)
+            glVertex3f(x + fill_width, y + height, 0)
+            glVertex3f(x, y + height, 0)
+            glEnd()
+
+    def draw_hud(self):
+        glDisable(GL_DEPTH_TEST)  # Disable depth test for 2D HUD
+        
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        gluOrtho2D(0, window_width, 0, window_height)
+
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        bar_w = 200
+        bar_h = 25
+
+        #player health bar text
+        life_text = f"Player HP:"
+        self.draw_text(30, window_height - 25, life_text, GLUT_BITMAP_HELVETICA_18)
+
+        #capsule health bar text
+        life_text = f"Capsule HP:"
+        self.draw_text(30, 60, life_text, GLUT_BITMAP_HELVETICA_18)
+
+        # Player bar — top-left, green
+        self.draw_health_bar(
+            x=30,
+            y=window_height - 60,
+            width=bar_w,
+            height=bar_h,
+            current= self.player_health,
+            maximum=5,
+            fill_color=(0.2, 0.9, 0.3)
+        )
+
+        # Capsule bar — bottom-left, cyan
+        self.draw_health_bar(
+            x= 30,
+            y=25,
+            width=bar_w,
+            height=bar_h,
+            current= self.capsule_health,
+            maximum= 5,
+            fill_color=(0.2, 0.8, 1.0)
+        )
+        
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        glEnable(GL_DEPTH_TEST) # Re-enable depth test
+
+    def draw_text(self, x, y, text, font=GLUT_BITMAP_HELVETICA_18):
+            glMatrixMode(GL_PROJECTION)
+            glPushMatrix()
+            glLoadIdentity()
+            # Set up an orthographic projection that matches window coordinates
+            gluOrtho2D(0, window_width, 0, window_height)  # left, right, bottom, top
+
+            glMatrixMode(GL_MODELVIEW)
+            glPushMatrix()
+            glLoadIdentity()
+            
+            glColor3f(1, 1, 1)
+            # Draw text at (x, y) in screen coordinates
+            glRasterPos2f(x, y)
+            for ch in text:
+                glutBitmapCharacter(font, ord(ch))
+            
+            # Restore original projection and modelview matrices
+            glPopMatrix()
+            glMatrixMode(GL_PROJECTION)
+            glPopMatrix()
+            glMatrixMode(GL_MODELVIEW)
 
     def draw_elements(self):
         self.draw_lab()     
@@ -621,6 +859,8 @@ class Last_Lab_Defender:
         # call the functions 
         self.draw_elements()
         self.bullet_movement()
+
+        self.draw_hud()
         glutSwapBuffers()
 
 def main():
