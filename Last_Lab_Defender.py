@@ -4,14 +4,15 @@ from OpenGL.GLU import *
 import math
 import random 
 from OpenGL.GLUT import GLUT_BITMAP_HELVETICA_18
+import time
 
 # Global variables 
-camera_pos = (800, 800, 700)
-camera_look_at = (377,77,75)
+camera_pos = (1000, 1000, 800)
+camera_look_at = (327,77,75)
 axis_decision = (0, 0, 1)
-window_height, window_width = 600, 1250
-field_of_view = 50
-GRID_LENGTH, GRID_WIDTH = 1275, 1275
+window_height, window_width = 630, 1270
+field_of_view = 90
+GRID_LENGTH, GRID_WIDTH = 2250, 2250
 
 class Last_Lab_Defender:
     def __init__(self):
@@ -19,9 +20,24 @@ class Last_Lab_Defender:
         self.floor_left_max = GRID_LENGTH//2
         self.floor_behind_max = -GRID_WIDTH//2
         self.floor_front_max = GRID_WIDTH//2
+        self.initiate_all()
+
+    def initiate_all(self):
+
+        # time related 
+        self.level_1_time_limit = 60 #  60 seconds
+        self.level_2_time_limit = 60 #  60 seconds
+        self.start_time = time.time()
 
         # game level 
         self.game_level = 1
+
+        # kill count
+        self.total_kills = 0
+        self.level_1_kill_limit = 30
+        self.level_2_kill_limit = 40
+        self.level_1_limit_crossed = False
+        self.level_2_limit_crossed = False        
 
         # capsule informations (Positioned near the top-left positive axes)
         self.capsule_height = GRID_LENGTH // 10
@@ -30,6 +46,7 @@ class Last_Lab_Defender:
         self.capsule_base_position = [self.floor_left_max - 260, self.floor_front_max - 260, 0]
         self.capsule_base_height = 10
         self.capsule_health = 10
+
 
         # protagonist informations
         self.player_angle = 0
@@ -45,8 +62,8 @@ class Last_Lab_Defender:
         self.player_speed = 10
               
         # bullets information
-        self.bullet_size = 5
-        self.bullet_speed = 6
+        self.bullet_size = 6
+        self.bullet_speed = 16
         self.all_bullets = []
         
         # --- ENEMY & PLAYER STATE VARIABLES ---
@@ -63,7 +80,62 @@ class Last_Lab_Defender:
         self.enemy_head_radius = 25 
         
         # Floor alignment: Base Z is their radius so they sit exactly on the floor
-        self.enemy_base_z = self.enemy_body_radius
+        self.enemy_base_z = self.enemy_body_radius   
+
+        # --- CONTINUOUS SPAWN TIMER ---
+        # Tracks the last time a new enemy was timed-spawned (5-second interval)
+        self.last_spawn_time = time.time()
+
+        # --- ENEMY PROJECTILE STATE (Level 2+) ---
+        # List of active enemy bullets; each entry is a dict identical in shape
+        # to self.all_bullets so the same movement pattern can be reused.
+        self.enemy_bullets = []
+        # Enemy bullets travel slower than the player's bullets for fairness.
+        # Reduced from 5 → 3.5 (~30% nerf) to widen the player's reaction window.
+        self.enemy_bullet_speed = 3.5   # player bullet_speed is 16
+        # Size of the rendered enemy bullet cube
+        self.enemy_bullet_size = 8
+
+        # --- CENTRALISED VOLLEY COORDINATOR (Level 2+) ---
+        # Instead of every enemy firing independently (which causes bullet-hell),
+        # a global timer selects 2-3 random normal enemies to fire a coordinated
+        # volley every volley_interval seconds.
+        self.enemy_volley_timer = time.time()
+        self.volley_interval = 2.0  # seconds between volleys
+
+        # --- PLAYER HIT TOLERANCE (Level 2+ damage mitigation) ---
+        # Instead of losing HP on every single bullet hit, the player must
+        # accumulate 5 hits before 1 HP is actually deducted.  This prevents
+        # the rapid health drain visible in the Level 2 combat log.
+        self.player_hit_tolerance = 0
+
+        # --- LEVEL 3 FINAL BOSS STATE ---
+        self.boss_spawned = False
+        self.cannonballs = []
+        self.cannonball_speed = 1.5
+        self.cannonball_size = 45  # Increased drawing scale/radius
+        self.consecutive_cannonballs_destroyed = 0
+
+        #player-view
+        self.first_person_view = False     
+
+
+    def time_control(self):
+        self.time_passed  = time.time() - self.start_time
+        self.remaining_time = max(0, self.level_1_time_limit - self.time_passed)
+        if self.remaining_time <= 0:
+            self.game_level_upgrader()
+            self.start_time = time.time()
+
+    def display_time(self):
+        if self.remaining_time > 59:
+            time_left = "01:00"
+            time_text = f"Remaining Time: {time_left}"
+        else:
+            time_left = int(self.remaining_time)
+            time_text= f"Remaining Time: 00:{time_left}"
+
+        self.draw_text(window_width - 250, window_height - 30, time_text )
     
     def draw_protagonist(self):
         p_x,  p_y , p_z =  self.player_spawn_position
@@ -344,66 +416,202 @@ class Last_Lab_Defender:
     # --- ENEMY METHODS ---
 
     def get_random_spawn_coordinates(self):
-        # The cylinder is at the Top-Left corner (Left Max, Front Max).
-        # We will spawn enemies in the other three corners of the arena.
-        corners = [
-            # 1. Top-Right Corner
-            (self.floor_right_max + 50, self.floor_right_max + 350, 
-             self.floor_front_max - 350, self.floor_front_max - 50),
-            
-            # 2. Bottom-Left Corner
-            (self.floor_left_max - 350, self.floor_left_max - 50, 
-             self.floor_behind_max + 50, self.floor_behind_max + 350),
-             
-            # 3. Bottom-Right Corner (Opposite)
-            (self.floor_right_max + 50, self.floor_right_max + 350, 
-             self.floor_behind_max + 50, self.floor_behind_max + 350)
-        ]
-        
-        # Pick one of the 3 valid corners randomly
-        chosen_corner = random.choice(corners)
-        
-        # Generate random x and y within that specific corner
-        ex = random.randint(chosen_corner[0], chosen_corner[1])
-        ey = random.randint(chosen_corner[2], chosen_corner[3])
-        
-        return ex, ey
+
+        cap_x, cap_y, _ = self.capsule_position
+
+        # Radius within which no enemy may spawn (protects the capsule start zone)
+        exclusion_radius = 500
+
+        # Minimum separation between a new spawn and every existing enemy
+        min_enemy_separation = self.enemy_body_radius * 2.5
+
+        # Safety cap so we never loop forever in a crowded arena
+        max_attempts = 50
+
+        # Keep a small margin from the walls so the enemy body never clips them
+        margin = int(self.enemy_body_radius)
+        x_min = self.floor_right_max + margin   # floor_right_max is the NEGATIVE X bound
+        x_max = self.floor_left_max  - margin   # floor_left_max  is the POSITIVE X bound
+        y_min = self.floor_behind_max + margin  # floor_behind_max is the NEGATIVE Y bound
+        y_max = self.floor_front_max  - margin  # floor_front_max  is the POSITIVE Y bound
+
+        for attempt in range(max_attempts):
+            # --- Step 1: pick a random point anywhere in the arena ---
+            ex = random.uniform(x_min, x_max)
+            ey = random.uniform(y_min, y_max)
+
+            # --- Step 2: exclusion-zone check (distance from capsule) ---
+            dist_to_capsule = math.sqrt((ex - cap_x) ** 2 + (ey - cap_y) ** 2)
+            if dist_to_capsule < exclusion_radius:
+                # Too close to the capsule — try again
+                continue
+
+            # --- Step 3: overlap check against every active enemy ---
+            too_close_to_enemy = False
+            for existing_enemy in self.enemies:
+                dist_to_enemy = math.sqrt(
+                    (ex - existing_enemy['x']) ** 2 +
+                    (ey - existing_enemy['y']) ** 2
+                )
+                if dist_to_enemy < min_enemy_separation:
+                    too_close_to_enemy = True
+                    break  # No need to check remaining enemies
+
+            if too_close_to_enemy:
+                # Overlaps an existing enemy — try again
+                continue
+
+            # Valid position found — return immediately
+            return int(ex), int(ey)
+
+        # Fallback: if every attempt failed (very crowded arena), return the
+        # last generated point so spawning doesn't silently break.
+        print(f"[SpawnWarning] Could not find a non-overlapping spawn after {max_attempts} attempts.")
+        return int(ex), int(ey)
 
     def spawn_enemies(self):
+
         if self.game_level == 1:
+
+            #Initial burst: fill an empty arena immediately
             if len(self.enemies) == 0:
                 num_enemies = random.randint(6, 8)
                 for _ in range(num_enemies):
                     ex, ey = self.get_random_spawn_coordinates()
-                    
                     self.enemies.append({
-                        'x': ex, 'y': ey, 
-                        'z': self.enemy_base_z, 
-                        'base_z': self.enemy_base_z, # Floor level
-                        'run_cycle': random.uniform(0.0, 5.0), # Randomize animation start
+                        'x': ex, 'y': ey,
+                        'z': self.enemy_base_z,
+                        'base_z': self.enemy_base_z,          # Floor level
+                        'run_cycle': random.uniform(0.0, 5.0),# Stagger animation
                         'type': 'normal',
                         'body_r': self.enemy_body_radius,
                         'head_r': self.enemy_head_radius,
                         # Teal/Ocean Blue: hex #007D8C → normalized floats
                         'color': (0.0, 125/255.0, 140/255.0)
                     })
-                    
-            if self.normal_enemies_killed >= 20:
-                self.normal_enemies_killed -= 20 
-                
-                # Special enemies also spawn in one of the 3 valid corners
+                # Reset the timer so the first timed spawn waits a full 5 s
+                # from when the initial burst was created, not from game start.
+                self.last_spawn_time = time.time()
+
+            # ── Continuous time-based spawn: 1 enemy every 5 seconds ──────────
+            current_time = time.time()
+            if current_time - self.last_spawn_time >= 5.0:
                 ex, ey = self.get_random_spawn_coordinates()
-                
                 self.enemies.append({
-                    'x': ex, 'y': ey, 
-                    'z': self.enemy_base_z * 1.5, 
+                    'x': ex, 'y': ey,
+                    'z': self.enemy_base_z,
+                    'base_z': self.enemy_base_z,
+                    'run_cycle': random.uniform(0.0, 5.0),
+                    'type': 'normal',
+                    'body_r': self.enemy_body_radius,
+                    'head_r': self.enemy_head_radius,
+                    'color': (0.0, 125/255.0, 140/255.0)
+                })
+                # Reset the spawn clock for the next 5-second window
+                self.last_spawn_time = current_time
+                print(f"[Spawn] Timed enemy spawned. Total active enemies: {len(self.enemies)}")
+
+            # ── Special enemy: triggered every 20 normal kills ─────────────────
+            if self.normal_enemies_killed >= 20:
+                self.normal_enemies_killed -= 20  # Consume the 20-kill credit
+
+                ex, ey = self.get_random_spawn_coordinates()
+                self.enemies.append({
+                    'x': ex, 'y': ey,
+                    'z': self.enemy_base_z * 1.5,
                     'base_z': self.enemy_base_z * 1.5,
                     'run_cycle': random.uniform(0.0, 5.0),
                     'type': 'special',
-                    'body_r': self.enemy_body_radius * 1.5, 
+                    'body_r': self.enemy_body_radius * 1.5,
                     'head_r': self.enemy_head_radius * 1.5,
-                    'color': (1.0, 0.0, 0.0)
+                    'color': (1.0, 0.0, 0.0)   # Red — visually distinct
                 })
+                print(f"[Spawn] Special enemy spawned after 20 kills! Active enemies: {len(self.enemies)}")
+
+        elif self.game_level == 2:
+            # ═══════════════════════════════════════════════════════════════
+            # LEVEL 2 SPAWN LOGIC
+            # Same structure as Level 1 but enemies carry a shoot_timer and
+            # use a darker navy colour (#004B54) to signal the difficulty jump.
+            # Special enemies remain red and never receive a shoot_timer.
+            # ═══════════════════════════════════════════════════════════════
+
+            # ── Level 2 colour constants ───────────────────────────────────────
+            # Mint / Emerald Green: hex #1bc476 → normalised floats
+            L2_NORMAL_COLOR = (27/255.0, 196/255.0, 118/255.0)
+
+            # ── Initial burst ──────────────────────────────────────────────────
+            if len(self.enemies) == 0:
+                num_enemies = random.randint(7, 10)  # Slightly larger wave in L2
+                for _ in range(num_enemies):
+                    ex, ey = self.get_random_spawn_coordinates()
+                    self.enemies.append({
+                        'x': ex, 'y': ey,
+                        'z': self.enemy_base_z,
+                        'base_z': self.enemy_base_z,
+                        'run_cycle': random.uniform(0.0, 5.0),
+                        'type': 'normal',
+                        'body_r': self.enemy_body_radius,
+                        'head_r': self.enemy_head_radius,
+                        'color': L2_NORMAL_COLOR
+                        # No individual shoot_timer — firing is handled by the
+                        # centralised volley coordinator in update_enemy_combat().
+                    })
+                self.last_spawn_time = time.time()
+
+            # ── Continuous timed spawn ─────────────────────────────────────────
+            current_time = time.time()
+            if current_time - self.last_spawn_time >= 5.0:
+                ex, ey = self.get_random_spawn_coordinates()
+                self.enemies.append({
+                    'x': ex, 'y': ey,
+                    'z': self.enemy_base_z,
+                    'base_z': self.enemy_base_z,
+                    'run_cycle': random.uniform(0.0, 5.0),
+                    'type': 'normal',
+                    'body_r': self.enemy_body_radius,
+                    'head_r': self.enemy_head_radius,
+                    'color': L2_NORMAL_COLOR
+                    # No individual shoot_timer — volley coordinator handles firing.
+                })
+                self.last_spawn_time = current_time
+                print(f"[L2 Spawn] Timed enemy spawned. Active: {len(self.enemies)}")
+
+            # ── Special enemy (every 20 normal kills, still red, no gun) ───────
+            if self.normal_enemies_killed >= 20:
+                self.normal_enemies_killed -= 20
+
+                ex, ey = self.get_random_spawn_coordinates()
+                self.enemies.append({
+                    'x': ex, 'y': ey,
+                    'z': self.enemy_base_z * 1.5,
+                    'base_z': self.enemy_base_z * 1.5,
+                    'run_cycle': random.uniform(0.0, 5.0),
+                    'type': 'special',           # Special enemies do NOT shoot
+                    'body_r': self.enemy_body_radius * 1.5,
+                    'head_r': self.enemy_head_radius * 1.5,
+                    'color': (1.0, 0.0, 0.0)     # Always red, no shoot_timer
+                })
+                print(f"[L2 Spawn] Special enemy spawned! Active: {len(self.enemies)}")
+
+        elif self.game_level == 3:
+            # ═══════════════════════════════════════════════════════════════
+            # LEVEL 3 SPAWN LOGIC: FINAL BOSS
+            # ═══════════════════════════════════════════════════════════════
+            if not self.boss_spawned and len(self.enemies) == 0:
+                ex, ey = self.get_random_spawn_coordinates()
+                self.enemies.append({
+                    'x': ex, 'y': ey,
+                    'z': self.enemy_base_z * 2.5,
+                    'base_z': self.enemy_base_z * 2.5,
+                    'run_cycle': 0.0,
+                    'type': 'boss',
+                    'body_r': self.enemy_body_radius * 2.5,
+                    'head_r': self.enemy_head_radius * 2.5,
+                    'color': (94/255.0, 4/255.0, 135/255.0) # Dark Purple
+                })
+                self.boss_spawned = True
+                print("Final Boss Spawned!")
 
     def enemy_movement(self):
         target_x, target_y, _ = self.capsule_position
@@ -433,15 +641,63 @@ class Last_Lab_Defender:
                 continue # Skip moving this enemy as it's being removed
 
             # Normalize vector and move enemy towards the capsule
-            if distance > 0:
-                enemy['x'] += (dx / distance) * self.enemy_speed
-                enemy['y'] += (dy / distance) * self.enemy_speed
+            if enemy['type'] == 'boss':
+                # --- Final Boss Movement Correction ---
+                # Strictly lock depth (Y-axis) to the far back wall and sweep horizontally (X-axis)
                 
-                # Slower Bobbing Animation scaled for larger bodies
-                enemy['run_cycle'] += 0.08 
-                bounce_height = abs(math.sin(enemy['run_cycle'])) * 15
-                enemy['z'] = enemy['base_z'] + bounce_height
+                margin = int(enemy['body_r'])
+                x_min = self.floor_right_max + margin
+                x_max = self.floor_left_max - margin
                 
+                # Lock base Y to the far back wall (opposite the player/capsule)
+                base_y = self.floor_behind_max + margin + 100 # Add a small buffer
+
+                # 1. Lateral Sweep (X-Axis Macro-Movement)
+                if 'boss_direction_x' not in enemy:
+                    enemy['boss_direction_x'] = 1  # 1 for right, -1 for left
+                    enemy['y'] = base_y            # Initialize Y to locked back wall
+
+                # Base horizontal sweep speed
+                base_sweep_speed = self.enemy_speed * 1.5
+                
+                # 2. Evasive Strafing (Micro-Movement)
+                enemy['run_cycle'] += 0.05
+                
+                # Erratic stuttering effect applied to the X sweep speed
+                # math.cos() oscillates between -1 and 1, creating a juke/stutter effect
+                speed_wobble = math.cos(enemy['run_cycle'] * 1.5) * base_sweep_speed * 1.2
+                
+                # Calculate new X position (Macro sweep + Micro wobble)
+                new_x = enemy['x'] + (enemy['boss_direction_x'] * base_sweep_speed) + speed_wobble
+                
+                # Boundary bouncing (Toggle direction at edges)
+                if new_x > x_max:
+                    new_x = x_max
+                    enemy['boss_direction_x'] = -1
+                elif new_x < x_min:
+                    new_x = x_min
+                    enemy['boss_direction_x'] = 1
+                    
+                enemy['x'] = new_x
+                
+                # 3. Strict Depth Lock (Y-Axis Restraint)
+                # A very slight depth wobble (+/- 20 units) to enhance the evasive feel
+                # while strictly clamping the macro Y position so it never advances.
+                depth_wobble = math.sin(enemy['run_cycle'] * 2.0) * 20.0
+                enemy['y'] = base_y + depth_wobble
+
+                # Bobbing animation (Z-axis)
+                enemy['z'] = enemy['base_z'] + abs(math.sin(enemy['run_cycle'] * 2)) * 20
+            else:
+                if distance > 0:
+                    enemy['x'] += (dx / distance) * self.enemy_speed
+                    enemy['y'] += (dy / distance) * self.enemy_speed
+
+                    # Bobbing animation (both levels)
+                    enemy['run_cycle'] += 0.08
+                    bounce_height = abs(math.sin(enemy['run_cycle'])) * 15
+                    enemy['z'] = enemy['base_z'] + bounce_height
+
         # Safely remove enemies that hit the cylinder or player
         for i in sorted(enemies_to_remove, reverse=True):
             if i < len(self.enemies):
@@ -470,8 +726,15 @@ class Last_Lab_Defender:
                         if self.player_health < 5:
                             self.player_health += 1
                             print(f"Special Enemy Killed! Health increased to {self.player_health}")
+                            
                     else:
                         self.normal_enemies_killed += 1
+                    # increases the kill count 
+                    self.total_kills += 1                        
+                    if self.game_level == 1 and self.total_kills >= self.level_1_kill_limit:
+                        self.level_1_limit_crossed = True
+                    elif self.game_level == 2 and self.total_kills >= self.level_2_kill_limit:
+                        self.level_2_limit_crossed = True                    
                     break  
 
         for i in sorted(bullets_to_remove, reverse=True):
@@ -481,6 +744,12 @@ class Last_Lab_Defender:
         for i in sorted(enemies_to_remove, reverse=True):
             if i < len(self.enemies):
                 self.enemies.pop(i)
+
+    def display_kill_count(self):
+        limit = self.level_1_kill_limit if self.game_level == 1 else self.level_2_kill_limit
+        kill_text = f"Level {self.game_level} total Kills: {self.total_kills}/{limit}" 
+        self.draw_text(window_width - 250, window_height - 60, kill_text)
+
 
     def draw_enemies(self):
         for enemy in self.enemies:
@@ -507,9 +776,15 @@ class Last_Lab_Defender:
             gluSphere(gluNewQuadric(), hr, 30, 30)
 
             # --- Head Appendages ---
-            h_base_r = hr * 0.22
-            h_top_r  = 0.01
-            h_height = hr * 0.8
+            if enemy['type'] == 'boss':
+                # Two distinctly large horns for the massive Boss head
+                h_base_r = hr * 0.4
+                h_top_r  = hr * 0.1
+                h_height = hr * 1.5
+            else:
+                h_base_r = hr * 0.22
+                h_top_r  = 0.01
+                h_height = hr * 0.8
 
             # Horn 1
             glPushMatrix()
@@ -621,7 +896,281 @@ class Last_Lab_Defender:
             gluSphere(gluNewQuadric(), hand_r, 20, 20)
             glPopMatrix()
 
+            # ── Level 2 Gun Barrel (right hand, normal enemies only) ───────────
+            # Gated behind game_level >= 2 AND enemy type check so that:
+            #   • Level 1 enemies are visually unchanged.
+            #   • Special enemies (red healers) never carry a weapon.
+            if enemy['type'] == 'boss':
+                # Boss Legs
+                leg_len = br * 1.5
+                leg_r = br * 0.3
+                
+                # Left Leg
+                glPushMatrix()
+                glColor3f(cr * 0.7, cg * 0.7, cb * 0.7)
+                glTranslatef(-br * 0.5, 0, -br * 0.8)
+                glRotatef(90, 1, 0, 0)
+                gluCylinder(gluNewQuadric(), leg_r, leg_r*0.8, leg_len, 20, 5)
+                glPopMatrix()
+
+                # Right Leg
+                glPushMatrix()
+                glColor3f(cr * 0.7, cg * 0.7, cb * 0.7)
+                glTranslatef(br * 0.5, 0, -br * 0.8)
+                glRotatef(90, 1, 0, 0)
+                gluCylinder(gluNewQuadric(), leg_r, leg_r*0.8, leg_len, 20, 5)
+                glPopMatrix()
+                
+                # Massive Cannon on right hand
+                cannon_base_r = hand_r * 1.5
+                cannon_tip_r = hand_r * 1.2
+                cannon_length = br * 2.0
+                wrist_x = shoulder_offset
+                wrist_y = elbow_y - upper_arm_len * 0.7
+                wrist_z = elbow_z - upper_arm_len * 0.5
+
+                glPushMatrix()
+                glColor3f(0.15, 0.15, 0.15)
+                glTranslatef(wrist_x, wrist_y, wrist_z)
+                glRotatef(-90, 1, 0, 0)
+                gluCylinder(gluNewQuadric(), cannon_base_r, cannon_tip_r, cannon_length, 20, 5)
+                glPopMatrix()
+            elif self.game_level >= 2 and enemy['type'] != 'special':
+                # Gun barrel: a thin gluCylinder attached at the wrist tip,
+                # pointing forward (along +Y in the enemy's local space).
+                gun_base_r  = hand_r * 0.45   # matches arm taper style
+                gun_tip_r   = hand_r * 0.25
+                gun_length  = br * 1.4         # barrel extends past the hand
+
+                # Anchor at the same wrist-tip position as the right hand sphere
+                wrist_x = shoulder_offset
+                wrist_y = elbow_y - upper_arm_len * 0.7
+                wrist_z = elbow_z - upper_arm_len * 0.5
+
+                glPushMatrix()
+                # Dark metallic grey for the weapon
+                glColor3f(0.25, 0.25, 0.28)
+                glTranslatef(wrist_x, wrist_y, wrist_z)
+                # Rotate so the cylinder points along -Y (forward direction)
+                # gluCylinder naturally points along +Z, so we rotate -90° around X
+                glRotatef(-90, 1, 0, 0)
+                gluCylinder(gluNewQuadric(), gun_base_r, gun_tip_r, gun_length, 12, 4)
+                glPopMatrix()
+
             glPopMatrix()  # base enemy transform
+
+    def update_enemy_combat(self):
+
+        if self.game_level >= 2:
+            if self.game_level == 3:
+                current_time = time.time()
+                if current_time - self.enemy_volley_timer < self.volley_interval * 1.5:
+                    return
+                self.enemy_volley_timer = current_time
+                
+                bosses = [e for e in self.enemies if e['type'] == 'boss']
+                if not bosses:
+                    return
+                boss = bosses[0]
+                
+                px, py, _ = self.player_spawn_position
+                ex_pos, ey_pos = boss['x'], boss['y']
+                bz = boss['base_z']
+                shoot_dx = px - ex_pos
+                shoot_dy = py - ey_pos
+                shoot_dist = math.sqrt(shoot_dx ** 2 + shoot_dy ** 2)
+                if shoot_dist > 0:
+                    shoot_dx /= shoot_dist
+                    shoot_dy /= shoot_dist
+                    self.cannonballs.append({
+                        'coord': [ex_pos, ey_pos, bz],
+                        'direction': [shoot_dx, shoot_dy],
+                        'health': 5
+                    })
+                print(f"[Boss] Fired Cannonball. Active: {len(self.cannonballs)}")
+                return
+
+            current_time = time.time()
+            if current_time - self.enemy_volley_timer < self.volley_interval:
+                return  # Volley cooldown hasn't elapsed yet
+
+            # ── Reset the global volley timer ──────────────────────────────────
+            self.enemy_volley_timer = current_time
+
+            # ── Filter to only normal enemies (special enemies never shoot) ────
+            normal_enemies = [e for e in self.enemies if e['type'] == 'normal']
+            if not normal_enemies:
+                return  # Nothing to fire from
+
+            # ── Select 2-3 random shooters from the pool ──────────────────────
+            # If fewer than 2 normal enemies are alive, all of them fire.
+            volley_count = random.randint(2, 3)
+            shooters = random.sample(
+                normal_enemies,
+                min(volley_count, len(normal_enemies))
+            )
+
+            # ── Each selected enemy fires one bullet at the player ─────────────
+            px, py, _ = self.player_spawn_position
+
+            for enemy in shooters:
+                ex_pos, ey_pos = enemy['x'], enemy['y']
+                # Bullet spawns at body-centre height so it visually exits the gun
+                bz = enemy['base_z']
+
+                # Normalised 2-D direction vector: enemy → player
+                shoot_dx = px - ex_pos
+                shoot_dy = py - ey_pos
+                shoot_dist = math.sqrt(shoot_dx ** 2 + shoot_dy ** 2)
+
+                if shoot_dist > 0:  # Guard against division by zero
+                    shoot_dx /= shoot_dist
+                    shoot_dy /= shoot_dist
+                    self.enemy_bullets.append({
+                        'bullet_coord': [ex_pos, ey_pos, bz],
+                        'bullet_direction': [shoot_dx, shoot_dy]
+                    })
+
+            print(f"[Volley] {len(shooters)} enemies fired. Active bullets: {len(self.enemy_bullets)}")
+
+    def update_enemy_bullets(self):
+
+        bullets_to_remove = []
+        for i, bullet in enumerate(self.enemy_bullets):
+            coord = bullet['bullet_coord']
+            direction = bullet['bullet_direction']
+
+            new_x = coord[0] + self.enemy_bullet_speed * direction[0]
+            new_y = coord[1] + self.enemy_bullet_speed * direction[1]
+
+            # Keep the bullet if it is still inside the arena
+            if (-GRID_WIDTH // 2 < new_x < GRID_WIDTH // 2 and
+                    -GRID_WIDTH // 2 < new_y < GRID_WIDTH // 2):
+                bullet['bullet_coord'][0] = new_x
+                bullet['bullet_coord'][1] = new_y
+            else:
+                bullets_to_remove.append(i)  # Out of bounds — queue for removal
+
+        # Remove out-of-bounds bullets in reverse order to preserve indices
+        for i in sorted(bullets_to_remove, reverse=True):
+            if i < len(self.enemy_bullets):
+                self.enemy_bullets.pop(i)
+
+    def draw_enemy_bullets(self):
+
+        for bullet in self.enemy_bullets:
+            bx, by, bz = bullet['bullet_coord']
+            glPushMatrix()
+            glTranslatef(bx, by, bz)
+            glColor3f(1.0, 0.5, 0.0)   # Orange — distinct from player's yellow
+            glutSolidCube(self.enemy_bullet_size)
+            glPopMatrix()
+
+    def enemy_bullet_player_collision(self):
+
+        if self.game_level < 2:
+            return  # Short-circuit: Level 1 has no enemy bullets
+
+        bullets_to_remove = []
+        px, py, _ = self.player_spawn_position
+
+        for i, bullet in enumerate(self.enemy_bullets):
+            bx, by, _ = bullet['bullet_coord']
+            dist_2d = math.sqrt((bx - px) ** 2 + (by - py) ** 2)
+
+            # Hit radius: player silhouette + half the bullet cube diagonal
+            hit_radius = self.player_width + self.enemy_bullet_size / 2
+            if dist_2d < hit_radius:
+                bullets_to_remove.append(i)
+
+                # --- Hit Tolerance Logic ---
+                # Each confirmed bullet hit increments the tolerance counter.
+                # Only after 5 accumulated hits does the player lose 1 HP.
+                self.player_hit_tolerance += 1
+
+                if self.player_hit_tolerance >= 5:
+                    self.player_health = max(0, self.player_health - 1)
+                    self.player_hit_tolerance = 0  # Reset after HP deduction
+                    print(f"[EnemyBullet] 5 hits absorbed! HP reduced to {self.player_health}")
+
+        for i in sorted(bullets_to_remove, reverse=True):
+            if i < len(self.enemy_bullets):
+                self.enemy_bullets.pop(i)
+
+    def update_cannonballs(self):
+        balls_to_remove = []
+        for i, cb in enumerate(self.cannonballs):
+            cb['coord'][0] += self.cannonball_speed * cb['direction'][0]
+            cb['coord'][1] += self.cannonball_speed * cb['direction'][1]
+            if not (-GRID_WIDTH // 2 < cb['coord'][0] < GRID_WIDTH // 2 and -GRID_WIDTH // 2 < cb['coord'][1] < GRID_WIDTH // 2):
+                balls_to_remove.append(i)
+        for i in sorted(balls_to_remove, reverse=True):
+            if i < len(self.cannonballs):
+                self.cannonballs.pop(i)
+
+    def draw_cannonballs(self):
+        for cb in self.cannonballs:
+            bx, by, bz = cb['coord']
+            glPushMatrix()
+            glTranslatef(bx, by, bz)
+            glColor3f(109/255.0, 242/255.0, 220/255.0) # Bright Cyan/Teal
+            glutSolidSphere(self.cannonball_size, 16, 16)
+            glPopMatrix()
+
+    def cannonball_collisions(self):
+        if self.game_level != 3: return
+        balls_to_remove = []
+        player_bullets_to_remove = []
+        px, py, _ = self.player_spawn_position
+        cx, cy, _ = self.capsule_position
+
+        for i, cb in enumerate(self.cannonballs):
+            if i in balls_to_remove: continue
+            bx, by, _ = cb['coord']
+            
+            # Cannonball vs Capsule
+            dist_capsule = math.sqrt((bx - cx)**2 + (by - cy)**2)
+            if dist_capsule < (self.capsule_radius + self.cannonball_size):
+                self.capsule_health = max(0, self.capsule_health - 3) # x3 damage
+                balls_to_remove.append(i)
+                print(f"[Cannonball] Hit capsule! Health: {self.capsule_health}")
+                continue
+
+            # Cannonball vs Player
+            dist_player = math.sqrt((bx - px)**2 + (by - py)**2)
+            if dist_player < (self.player_width + self.cannonball_size):
+                self.player_health -= 2 # bypass hit tolerance
+                balls_to_remove.append(i)
+                print(f"[Cannonball] Hit player! Health: {self.player_health}")
+                continue
+                
+            # Cannonball vs Player Bullets
+            for j, pb in enumerate(self.all_bullets):
+                if j in player_bullets_to_remove: continue
+                pbx, pby, _ = pb['bullet_coord']
+                dist_bullet = math.sqrt((bx - pbx)**2 + (by - pby)**2)
+                if dist_bullet < (self.cannonball_size + self.bullet_size):
+                    player_bullets_to_remove.append(j)
+                    cb['health'] -= 1
+                    if cb['health'] <= 0:
+                        balls_to_remove.append(i)
+                        
+                        # --- Consecutive Health Reward Mechanic ---
+                        self.consecutive_cannonballs_destroyed += 1
+                        print(f"[Cannonball] Destroyed! Streak: {self.consecutive_cannonballs_destroyed}")
+                        
+                        if self.consecutive_cannonballs_destroyed == 2:
+                            self.player_health += 2
+                            self.consecutive_cannonballs_destroyed = 0
+                            print(f"[Reward] 2 Cannonballs destroyed! Player health: {self.player_health}")
+                    break
+
+        for j in sorted(player_bullets_to_remove, reverse=True):
+            if j < len(self.all_bullets):
+                self.all_bullets.pop(j)
+        for i in sorted(balls_to_remove, reverse=True):
+            if i < len(self.cannonballs):
+                self.cannonballs.pop(i)
 
     # --- END ENEMY METHODS ---
     def draw_health_bar(self, x, y, width, height, current, maximum, fill_color):
@@ -733,6 +1282,10 @@ class Last_Lab_Defender:
         self.draw_protagonist()
         self.draw_bullets()
         self.draw_enemies()
+        # Draw enemy projectiles (no-op in Level 1 as the list stays empty)
+        self.draw_enemy_bullets()
+        if self.game_level == 3:
+            self.draw_cannonballs()
 
     # controls
     def MouseListener(self, button, state, x, y):
@@ -744,6 +1297,14 @@ class Last_Lab_Defender:
                 'bullet_coord': [x, y, z],
                 'bullet_direction' : [dir_x, dir_y]
             })
+        
+        elif button == GLUT_RIGHT_BUTTON and state == GLUT_DOWN:
+                self.first_person_view = not self.first_person_view
+                if self.first_person_view:
+                    print("First-Person View: ON")
+                else:
+                    print("Third-Person View: ON")
+
 
     def KeyboardListener(self, key, x, y):
         global field_of_view
@@ -777,10 +1338,10 @@ class Last_Lab_Defender:
         elif key == b"a":
             self.player_angle += 5
         #  This part if for manually changing the level for checking the changes appearing
-        elif key == b"n":
-            self.game_level_upgrader(False)
-        elif key == b"m":
-            self.game_level_upgrader()
+        # elif key == b"n":
+        #     self.game_level_upgrader(False)
+        # elif key == b"m":
+        #     self.game_level_upgrader()
 
         glutPostRedisplay()
             
@@ -809,24 +1370,47 @@ class Last_Lab_Defender:
         glutPostRedisplay()
 
     # weapon upgrade:
-    def weapon_upgrade(self):
-        if self.game_level == 1:
-            self.level_weapon_head_color = (170/255, 120/255, 255/255)
-            self.level_weapon_handle_color = (200/255, 180/255, 255/255)
-        elif self.game_level == 2:
+    def weapon_upgrade(self, level = 1):
+
+        if self.level_1_limit_crossed and self.game_level == 2:
             self.level_weapon_head_color = (0/255, 200/255, 255/255)
             self.level_weapon_handle_color = (120/255, 255/255, 255/255)
-        elif self.game_level == 3:
+            self.bullet_speed = 55
+        elif self.level_2_limit_crossed   and self.game_level == 3:
             self.level_weapon_head_color = (255/255, 60/255, 120/255)
             self.level_weapon_handle_color = (255/255, 120/255, 180/255)  
+            self.bullet_speed = 80
+        else:
+            self.level_weapon_head_color = (170/255, 120/255, 255/255)
+            self.level_weapon_handle_color = (200/255, 180/255, 255/255)            
+
+
+    def display_level(self):
+            level_text = f"Level: {self.game_level}"
+            self.draw_text(window_width - window_width//2, window_height - 30, level_text )   
+
 
     # level decider
     def game_level_upgrader(self, up = True):
         if up:
             self.game_level = self.game_level + 1 if self.game_level < 3 else self.game_level
-        else:
-            self.game_level = self.game_level - 1 if self.game_level > 0 else self.game_level
+            self.total_kills = 0
+
+            # ── Bug Fix: Instant State Wipe on Level Up ──────────────────────
+            # Prevent surviving entities from bleeding into the new level
+            self.enemies.clear()
+            self.enemy_bullets.clear()
+            self.all_bullets.clear()
+            
+            if hasattr(self, 'cannonballs'):
+                self.cannonballs.clear()
+
+        # else:
+            # self.game_level = self.game_level - 1 if self.game_level > 0 else self.game_level
+
+        
         self.weapon_upgrade()
+        # self.enemy_upgrade()
         glutPostRedisplay()
 
     def animation(self):
@@ -835,15 +1419,33 @@ class Last_Lab_Defender:
     def setupCamera(self):
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
-        gluPerspective(field_of_view, window_width/window_height, 0.1, 2500)
+        gluPerspective(field_of_view, window_width/window_height, 0.1, 4500)
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
-        x, y, z = camera_pos
-        look_x, look_y,look_z = camera_look_at
-        respect_to_x, respect_to_y, respect_to_z = axis_decision
-        gluLookAt(x, y, z,
-                  look_x, look_y,look_z,
-                  respect_to_x, respect_to_y, respect_to_z)        
+
+        if self.first_person_view:
+            x, y, z = self.player_spawn_position
+            dir_x = math.cos(math.radians(self.player_angle-90))
+            dir_y = math.sin(math.radians(self.player_angle-90))
+            eye_height = self.player_body_height * 3.2
+            eye_forward_offset = self.player_head_radius + 12
+            eye_x = x + dir_x * eye_forward_offset
+            eye_y = y + dir_y * eye_forward_offset
+            eye_z = z + eye_height
+            look_dist = 100
+            look_x = eye_x + look_dist * dir_x
+            look_y = eye_y + look_dist * dir_y
+            look_z = eye_z
+            gluLookAt(eye_x, eye_y, eye_z,
+                    look_x, look_y,look_z,
+                    0, 0, 1)
+        else:
+            x, y, z = camera_pos
+            look_x, look_y,look_z = camera_look_at
+            respect_to_x, respect_to_y, respect_to_z = axis_decision
+            gluLookAt(x, y, z,
+                    look_x, look_y,look_z,
+                    respect_to_x, respect_to_y, respect_to_z)        
 
     def showScreen(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -851,10 +1453,30 @@ class Last_Lab_Defender:
         glViewport(0, 0, window_width, window_height)
         self.setupCamera()     
         
+        # show levels
+        self.display_level()
+
+        # time functions 
+        if self.game_level < 3:
+            self.time_control()
+            self.display_time()
+
+        # kill count 
+        self.display_kill_count()
+
+
         # Enemy calls
         self.spawn_enemies()
         self.enemy_movement()
         self.bullet_enemy_collision()
+
+        # Level 2+ enemy combat coordinator & projectile pipeline
+        self.update_enemy_combat()           # Centralised volley firing (2-3 enemies)
+        self.update_enemy_bullets()          # Advance enemy bullets each frame
+        self.enemy_bullet_player_collision() # Check if any enemy bullet hit the player
+        if self.game_level == 3:
+            self.update_cannonballs()
+            self.cannonball_collisions()
         
         # call the functions 
         self.draw_elements()
