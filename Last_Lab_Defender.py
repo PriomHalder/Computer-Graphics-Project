@@ -4,10 +4,16 @@ from OpenGL.GLU import *
 import math
 import random 
 from OpenGL.GLUT import GLUT_BITMAP_HELVETICA_18
+from OpenGL.GLUT import GLUT_BITMAP_TIMES_ROMAN_24
 import time
 
 # Global variables 
 camera_pos = (1000, 1000, 800)
+# camera_pos = (600, -600,400)
+# camera_pos = (0, -250, 120)
+# camera_pos = (80, -150, 90)
+# camera_pos = (-300, -200, 50)
+# camera_pos = (0, 0, 800)
 camera_look_at = (327,77,75)
 axis_decision = (0, 0, 1)
 window_height, window_width = 630, 1270
@@ -23,14 +29,24 @@ class Last_Lab_Defender:
         self.initiate_all()
 
     def initiate_all(self):
+        
+        # game intro
+        self.ongoing_game_restarted = False
+        self.game_intro_ongoing = True if self.ongoing_game_restarted is False else False
+        self.into = 1
+
 
         # time related 
         self.level_1_time_limit = 60 #  60 seconds
         self.level_2_time_limit = 60 #  60 seconds
         self.start_time = time.time()
+        self.remaining_time = self.level_1_time_limit
+        self.time_passed = 0
 
         # game level 
         self.game_level = 1
+        self.transition_pause = False
+        self.transition_start = None
 
         # kill count
         self.total_kills = 0
@@ -69,11 +85,15 @@ class Last_Lab_Defender:
         # --- ENEMY & PLAYER STATE VARIABLES ---
         self.player_health = 5  # "life line"
         self.normal_enemies_killed = 0
+        # Dedicated counter for the special-enemy spawn trigger.
+        # Separate from normal_enemies_killed so the two systems don't interfere.
+        self.normal_enemy_kills_for_special = 0
         
         self.enemies = []
         
-        # SLOWER ENEMY SPEED
-        self.enemy_speed = 0.75 
+        # ENEMY SPEED (Further reduced for L1/L2 density balance)
+        # Original: 0.75. Nerfed to 0.35 (~53% reduction) to manage dense swarms.
+        self.enemy_speed = 0.35 
         
         # Increased Enemy Size
         self.enemy_body_radius = 35 
@@ -119,13 +139,55 @@ class Last_Lab_Defender:
         #player-view
         self.first_person_view = False     
 
+    def game_intro(self):
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, window_width, 0, window_height, -1, 1)
+
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+
+        glDisable(GL_DEPTH_TEST)
+        glColor3f(0,0.4,0)
+        glBegin(GL_QUADS)
+        glVertex2f(0, window_height//2 + 50)
+        glVertex2f(window_width, window_height//2+ 50)
+        glColor3f(0.2,1,0.2)        
+        glVertex2f(window_width, window_height//2 - 50)
+        glVertex2f(0, window_height//2-50)
+        glEnd()
+
+        glEnable(GL_DEPTH_TEST)
+
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        
+        # transition text
+        transition_text = f"This is an intro"
+        self.draw_text(window_width//2 - 150 , window_height//2 - 10, transition_text,GLUT_BITMAP_TIMES_ROMAN_24)
+
+
 
     def time_control(self):
         self.time_passed  = time.time() - self.start_time
-        self.remaining_time = max(0, self.level_1_time_limit - self.time_passed)
-        if self.remaining_time <= 0:
-            self.game_level_upgrader()
-            self.start_time = time.time()
+        current_limit = self.level_1_time_limit if self.game_level == 1 else self.level_2_time_limit
+        self.remaining_time = max(0, current_limit - self.time_passed)
+        if self.remaining_time <= 0 and not self.transition_pause:
+            # showing transition  between levels
+            self.transition_pause = True
+            self.transition_start = time.time()
+
+            self.enemies.clear()
+            self.enemy_bullets.clear()
+            self.all_bullets.clear()
+            self.cannonballs.clear()
+            # self.game_level_upgrader()
+            # self.start_time = time.time()
 
     def display_time(self):
         if self.remaining_time > 59:
@@ -416,37 +478,162 @@ class Last_Lab_Defender:
     # --- ENEMY METHODS ---
 
     def get_random_spawn_coordinates(self):
+        """
+        For Levels 1 & 2: restrict spawn points to the three far boundary walls
+        that are opposite the capsule corner, creating a wall-emergence illusion.
 
+        Three spawn edges (capsule is near +X / +Y corner):
+          - Right wall  : x = floor_right_max  (negative X wall),  y varies
+          - Behind wall : y = floor_behind_max  (negative Y wall),  x varies
+          - Left wall   : x = floor_left_max    (positive X wall),  y varies
+            (left wall is the same side as the capsule in X, but the far -Y
+             end is far enough to safely spawn without exclusion-zone issues)
+
+        For Level 3 the function falls back to interior random placement so
+        the boss spawn logic is completely unaffected.
+        """
         cap_x, cap_y, _ = self.capsule_position
-
-        # Radius within which no enemy may spawn (protects the capsule start zone)
-        exclusion_radius = 500
-
-        # Minimum separation between a new spawn and every existing enemy
+        exclusion_radius = 500          # no spawn within this radius of the capsule
         min_enemy_separation = self.enemy_body_radius * 2.5
-
-        # Safety cap so we never loop forever in a crowded arena
         max_attempts = 50
-
-        # Keep a small margin from the walls so the enemy body never clips them
         margin = int(self.enemy_body_radius)
-        x_min = self.floor_right_max + margin   # floor_right_max is the NEGATIVE X bound
-        x_max = self.floor_left_max  - margin   # floor_left_max  is the POSITIVE X bound
-        y_min = self.floor_behind_max + margin  # floor_behind_max is the NEGATIVE Y bound
-        y_max = self.floor_front_max  - margin  # floor_front_max  is the POSITIVE Y bound
 
+        # Full arena bounds (with wall-clip margin)
+        x_min = self.floor_right_max + margin
+        x_max = self.floor_left_max  - margin
+        y_min = self.floor_behind_max + margin
+        y_max = self.floor_front_max  - margin
+
+        # ── Level 1 & 2: organic boundary spawn ───────────────────────────────
+        if self.game_level in (1, 2):
+            # spawn_padding places the enemy JUST inside the visible boundary so
+            # it walks naturally into the arena (no wall-clipping, no exact-edge snap).
+            spawn_padding = 50.0
+
+            # Inset spawn-line coordinates for each of the three far walls.
+            # The enemy starts at the boundary + padding and moves inward;
+        # ── Level 1: organic boundary spawn ───────────────────────────────
+        if self.game_level == 1:
+            spawn_padding = 50.0
+            right_wall_x  = self.floor_right_max + spawn_padding   # negative-X wall
+            behind_wall_y = self.floor_behind_max + spawn_padding   # negative-Y wall
+            left_wall_x   = self.floor_left_max  - spawn_padding    # positive-X wall
+
+            corner_margin = spawn_padding * 2
+            free_x_min = self.floor_right_max + corner_margin
+            free_x_max = self.floor_left_max  - corner_margin
+            free_y_min = self.floor_behind_max + corner_margin
+            free_y_max = self.floor_front_max  - corner_margin
+
+            px, py, _ = self.player_spawn_position
+            safe_dist = 150.0
+            
+            for attempt in range(max_attempts):
+                walls = {
+                    'right_wall':  (self.floor_right_max, 0),
+                    'behind_wall': (0, self.floor_behind_max),
+                    'left_wall':   (self.floor_left_max, 0)
+                }
+                ranked_walls = sorted(
+                    walls.keys(),
+                    key=lambda w: math.sqrt((walls[w][0] - px)**2 + (walls[w][1] - py)**2),
+                    reverse=True
+                )
+                edge = random.choice(ranked_walls[:2])
+                if edge == 'right_wall':
+                    ex = right_wall_x
+                    ey = random.uniform(free_y_min, free_y_max)
+                elif edge == 'behind_wall':
+                    ex = random.uniform(free_x_min, free_x_max)
+                    ey = behind_wall_y
+                else:
+                    ex = left_wall_x
+                    ey = random.uniform(free_y_min, free_y_max)
+                dist_to_cap = math.sqrt((ex - cap_x)**2 + (ey - cap_y)**2)
+                dist_to_player = math.sqrt((ex - px)**2 + (ey - py)**2)
+                if dist_to_cap < safe_dist or dist_to_player < safe_dist:
+                    continue
+                too_close = False
+                for existing in self.enemies:
+                    if math.sqrt((ex - existing['x'])**2 + (ey - existing['y'])**2) < min_enemy_separation:
+                        too_close = True
+                        break
+                if too_close:
+                    continue
+                return ex, ey
+            return random.uniform(free_x_min, free_x_max), behind_wall_y
+
+        # ── Level 2: enhanced organic boundary spawn ────────────────────────
+        elif self.game_level == 2:
+            spawn_padding = 50.0
+            right_wall_x  = self.floor_right_max + spawn_padding
+            behind_wall_y = self.floor_behind_max + spawn_padding
+            left_wall_x   = self.floor_left_max  - spawn_padding
+
+            corner_margin = spawn_padding * 2
+            free_x_min = self.floor_right_max + corner_margin
+            free_x_max = self.floor_left_max  - corner_margin
+            free_y_min = self.floor_behind_max + corner_margin
+            free_y_max = self.floor_front_max  - corner_margin
+
+            px, py, _ = self.player_spawn_position
+            
+            walls = {
+                'right_wall':  (self.floor_right_max, 0),
+                'behind_wall': (0, self.floor_behind_max),
+                'left_wall':   (self.floor_left_max, 0)
+            }
+            
+            ranked_walls = sorted(
+                walls.keys(),
+                key=lambda w: math.sqrt((walls[w][0] - cap_x)**2 + (walls[w][1] - cap_y)**2),
+                reverse=True
+            )
+
+            safe_dist = 150.0
+            
+            for attempt in range(max_attempts):
+                edge = random.choice(ranked_walls[:2])
+                jitter = random.uniform(-15, 15)
+
+                if edge == 'right_wall':
+                    ex = right_wall_x + jitter
+                    ey = random.uniform(free_y_min, free_y_max)
+                elif edge == 'behind_wall':
+                    ex = random.uniform(free_x_min, free_x_max)
+                    ey = behind_wall_y + jitter
+                else:
+                    ex = left_wall_x + jitter
+                    ey = random.uniform(free_y_min, free_y_max)
+
+                dist_to_cap = math.sqrt((ex - cap_x)**2 + (ey - cap_y)**2)
+                dist_to_player = math.sqrt((ex - px)**2 + (ey - py)**2)
+                
+                if dist_to_cap < safe_dist or dist_to_player < safe_dist:
+                    continue
+
+                too_close = False
+                for existing in self.enemies:
+                    if math.sqrt((ex - existing['x'])**2 + (ey - existing['y'])**2) < min_enemy_separation:
+                        too_close = True
+                        break
+                if too_close:
+                    continue
+
+                return ex, ey
+
+            return random.uniform(free_x_min, free_x_max), behind_wall_y
+
+        # ── Level 3 (boss): interior random placement ────────────────────────
+        ex, ey = x_min, y_min
         for attempt in range(max_attempts):
-            # --- Step 1: pick a random point anywhere in the arena ---
             ex = random.uniform(x_min, x_max)
             ey = random.uniform(y_min, y_max)
 
-            # --- Step 2: exclusion-zone check (distance from capsule) ---
             dist_to_capsule = math.sqrt((ex - cap_x) ** 2 + (ey - cap_y) ** 2)
             if dist_to_capsule < exclusion_radius:
-                # Too close to the capsule — try again
                 continue
 
-            # --- Step 3: overlap check against every active enemy ---
             too_close_to_enemy = False
             for existing_enemy in self.enemies:
                 dist_to_enemy = math.sqrt(
@@ -455,66 +642,67 @@ class Last_Lab_Defender:
                 )
                 if dist_to_enemy < min_enemy_separation:
                     too_close_to_enemy = True
-                    break  # No need to check remaining enemies
+                    break
 
             if too_close_to_enemy:
-                # Overlaps an existing enemy — try again
                 continue
 
-            # Valid position found — return immediately
             return int(ex), int(ey)
 
-        # Fallback: if every attempt failed (very crowded arena), return the
-        # last generated point so spawning doesn't silently break.
         print(f"[SpawnWarning] Could not find a non-overlapping spawn after {max_attempts} attempts.")
         return int(ex), int(ey)
 
     def spawn_enemies(self):
 
         if self.game_level == 1:
+            # ─────────────────────────────────────────────────────────────────
+            # LEVEL 1 SPAWN LOGIC
+            # Enemies emerge from the three far boundary walls opposite the
+            # capsule, giving the illusion of wall-emergence.
+            # ─────────────────────────────────────────────────────────────────
 
-            #Initial burst: fill an empty arena immediately
-            if len(self.enemies) == 0:
-                num_enemies = random.randint(6, 8)
-                for _ in range(num_enemies):
+            # ── Population Threshold: Overlapping Waves (Requirement) ──────────
+            # Triggers whenever count drops to <= 6 to ensure constant pressure.
+            if len(self.enemies) <= 6:
+                num_to_spawn = random.randint(8, 10)
+                for _ in range(num_to_spawn):
                     ex, ey = self.get_random_spawn_coordinates()
                     self.enemies.append({
                         'x': ex, 'y': ey,
                         'z': self.enemy_base_z,
-                        'base_z': self.enemy_base_z,          # Floor level
-                        'run_cycle': random.uniform(0.0, 5.0),# Stagger animation
+                        'base_z': self.enemy_base_z,
+                        'run_cycle': random.uniform(0.0, 5.0),
                         'type': 'normal',
                         'body_r': self.enemy_body_radius,
                         'head_r': self.enemy_head_radius,
-                        # Teal/Ocean Blue: hex #007D8C → normalized floats
                         'color': (0.0, 125/255.0, 140/255.0)
                     })
-                # Reset the timer so the first timed spawn waits a full 5 s
-                # from when the initial burst was created, not from game start.
+                # Reset trickle timer after a major wave burst
                 self.last_spawn_time = time.time()
+                print(f"[L1 Wave] Population threshold hit (<=6). Spawned {num_to_spawn} new enemies. Total: {len(self.enemies)}")
 
-            # ── Continuous time-based spawn: 1 enemy every 5 seconds ──────────
+            # ── High-Density Continuous Spawn (Requirement: 5 every 5s) ────────
             current_time = time.time()
             if current_time - self.last_spawn_time >= 5.0:
-                ex, ey = self.get_random_spawn_coordinates()
-                self.enemies.append({
-                    'x': ex, 'y': ey,
-                    'z': self.enemy_base_z,
-                    'base_z': self.enemy_base_z,
-                    'run_cycle': random.uniform(0.0, 5.0),
-                    'type': 'normal',
-                    'body_r': self.enemy_body_radius,
-                    'head_r': self.enemy_head_radius,
-                    'color': (0.0, 125/255.0, 140/255.0)
-                })
-                # Reset the spawn clock for the next 5-second window
+                # Group of 5 enemies
+                for _ in range(5):
+                    ex, ey = self.get_random_spawn_coordinates()
+                    self.enemies.append({
+                        'x': ex, 'y': ey,
+                        'z': self.enemy_base_z,
+                        'base_z': self.enemy_base_z,
+                        'run_cycle': random.uniform(0.0, 5.0),
+                        'type': 'normal',
+                        'body_r': self.enemy_body_radius,
+                        'head_r': self.enemy_head_radius,
+                        'color': (0.0, 125/255.0, 140/255.0)
+                    })
                 self.last_spawn_time = current_time
-                print(f"[Spawn] Timed enemy spawned. Total active enemies: {len(self.enemies)}")
+                print(f"[L1 Spawn] Group of 5 enemies spawned from wall. Active: {len(self.enemies)}")
 
-            # ── Special enemy: triggered every 20 normal kills ─────────────────
-            if self.normal_enemies_killed >= 20:
-                self.normal_enemies_killed -= 20  # Consume the 20-kill credit
-
+            # ── Special enemy: inject 1 red enemy per 20 normal kills ─────────
+            if self.normal_enemy_kills_for_special >= 20:
+                self.normal_enemy_kills_for_special -= 20  # consume the credit
                 ex, ey = self.get_random_spawn_coordinates()
                 self.enemies.append({
                     'x': ex, 'y': ey,
@@ -526,24 +714,23 @@ class Last_Lab_Defender:
                     'head_r': self.enemy_head_radius * 1.5,
                     'color': (1.0, 0.0, 0.0)   # Red — visually distinct
                 })
-                print(f"[Spawn] Special enemy spawned after 20 kills! Active enemies: {len(self.enemies)}")
+                print(f"[L1 Spawn] Special enemy spawned after 20 kills! Active: {len(self.enemies)}")
 
         elif self.game_level == 2:
             # ═══════════════════════════════════════════════════════════════
             # LEVEL 2 SPAWN LOGIC
-            # Same structure as Level 1 but enemies carry a shoot_timer and
-            # use a darker navy colour (#004B54) to signal the difficulty jump.
-            # Special enemies remain red and never receive a shoot_timer.
+            # Same continuous structure as L1 but with a higher difficulty
+            # colour and special enemies triggering every 10 kills instead.
             # ═══════════════════════════════════════════════════════════════
 
-            # ── Level 2 colour constants ───────────────────────────────────────
             # Mint / Emerald Green: hex #1bc476 → normalised floats
             L2_NORMAL_COLOR = (27/255.0, 196/255.0, 118/255.0)
 
-            # ── Initial burst ──────────────────────────────────────────────────
-            if len(self.enemies) == 0:
-                num_enemies = random.randint(7, 10)  # Slightly larger wave in L2
-                for _ in range(num_enemies):
+            # ── Population Threshold: Overlapping Waves (Requirement: Increased Density) ──
+            # Target count increased for Level 2 to provide a significantly higher volume of enemies.
+            if len(self.enemies) <= 12:
+                num_to_spawn = random.randint(10, 15)
+                for _ in range(num_to_spawn):
                     ex, ey = self.get_random_spawn_coordinates()
                     self.enemies.append({
                         'x': ex, 'y': ey,
@@ -554,12 +741,11 @@ class Last_Lab_Defender:
                         'body_r': self.enemy_body_radius,
                         'head_r': self.enemy_head_radius,
                         'color': L2_NORMAL_COLOR
-                        # No individual shoot_timer — firing is handled by the
-                        # centralised volley coordinator in update_enemy_combat().
                     })
                 self.last_spawn_time = time.time()
+                print(f"[L2 Wave] Population threshold hit (<=12). Spawned {num_to_spawn} new enemies. Total: {len(self.enemies)}")
 
-            # ── Continuous timed spawn ─────────────────────────────────────────
+            # ── Continuous timed spawn: 1 enemy every 5 seconds ──────────
             current_time = time.time()
             if current_time - self.last_spawn_time >= 5.0:
                 ex, ey = self.get_random_spawn_coordinates()
@@ -572,27 +758,25 @@ class Last_Lab_Defender:
                     'body_r': self.enemy_body_radius,
                     'head_r': self.enemy_head_radius,
                     'color': L2_NORMAL_COLOR
-                    # No individual shoot_timer — volley coordinator handles firing.
                 })
                 self.last_spawn_time = current_time
                 print(f"[L2 Spawn] Timed enemy spawned. Active: {len(self.enemies)}")
 
-            # ── Special enemy (every 20 normal kills, still red, no gun) ───────
-            if self.normal_enemies_killed >= 20:
-                self.normal_enemies_killed -= 20
-
+            # ── Special enemy: every 10 kills in Level 2 (higher frequency) ───
+            if self.normal_enemy_kills_for_special >= 10:
+                self.normal_enemy_kills_for_special -= 10  # consume the credit
                 ex, ey = self.get_random_spawn_coordinates()
                 self.enemies.append({
                     'x': ex, 'y': ey,
                     'z': self.enemy_base_z * 1.5,
                     'base_z': self.enemy_base_z * 1.5,
                     'run_cycle': random.uniform(0.0, 5.0),
-                    'type': 'special',           # Special enemies do NOT shoot
+                    'type': 'special',
                     'body_r': self.enemy_body_radius * 1.5,
                     'head_r': self.enemy_head_radius * 1.5,
-                    'color': (1.0, 0.0, 0.0)     # Always red, no shoot_timer
+                    'color': (1.0, 0.0, 0.0)     # Always red
                 })
-                print(f"[L2 Spawn] Special enemy spawned! Active: {len(self.enemies)}")
+                print(f"[L2 Spawn] Special enemy spawned after 10 kills! Active: {len(self.enemies)}")
 
         elif self.game_level == 3:
             # ═══════════════════════════════════════════════════════════════
@@ -726,9 +910,11 @@ class Last_Lab_Defender:
                         if self.player_health < 5:
                             self.player_health += 1
                             print(f"Special Enemy Killed! Health increased to {self.player_health}")
-                            
+
                     else:
                         self.normal_enemies_killed += 1
+                        # Also feed the dedicated special-enemy trigger counter
+                        self.normal_enemy_kills_for_special += 1
                     # increases the kill count 
                     self.total_kills += 1                        
                     if self.game_level == 1 and self.total_kills >= self.level_1_kill_limit:
@@ -754,30 +940,52 @@ class Last_Lab_Defender:
     def draw_enemies(self):
         for enemy in self.enemies:
             ex, ey, ez = enemy['x'], enemy['y'], enemy['z']
-            
+
             # Unpack color components for reuse across body parts
             cr, cg, cb = enemy['color']
-            br = enemy['body_r']   # body radius — used as the arm scaling reference
-            hr = enemy['head_r']   # head radius
+            
+            # --- Requirement 2: Boss Scale Adjustment (Level 3) ---
+            # Increase base radius for Level 3 Boss to make it feel more massive.
+            # Proportional scaling is achieved by using 'br' for all subsequent offsets.
+            if enemy['type'] == 'boss':
+                br = enemy['body_r'] * 1.18  # Increase by ~18%
+                hr = enemy['head_r'] * 1.18
+            else:
+                br = enemy['body_r']
+                hr = enemy['head_r']
 
             # ── Base push: all geometry inherits this translation so
-            #    arms bob up/down with the existing run_cycle animation ──
+            #    appendages bob up/down with the existing run_cycle animation ──
             glPushMatrix()
             glTranslatef(ex, ey, ez)
 
-            # ── Body (Sphere) ─────────────────────────────────────────
+            # ── Yaw orientation (ALL enemies — body + weapon alignment) ────────
+            if enemy['type'] == 'boss':
+                px, py, _ = self.player_spawn_position
+                dx = px - ex
+                dz = py - ey
+            else:
+                cap_x, cap_y, _ = self.capsule_position
+                dx = cap_x - ex
+                dz = cap_y - ey
+
+            raw_yaw = math.degrees(math.atan2(dz, dx))
+            yaw_deg = raw_yaw + 90.0
+            glRotatef(yaw_deg, 0, 0, 1)
+
+            # --- Central Body ---
             glColor3f(cr, cg, cb)
             gluSphere(gluNewQuadric(), br, 30, 30)
 
             # ── Head (Sphere, raised above body) ──────────────────────
             glPushMatrix()
+            # Push head out further to accommodate larger body (pushed out by br)
             glTranslatef(0, 0, br + hr - 5)
-            glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)   # slightly darker shade
+            glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)
             gluSphere(gluNewQuadric(), hr, 30, 30)
 
-            # --- Head Appendages ---
+            # --- Head Appendages (Horns) ---
             if enemy['type'] == 'boss':
-                # Two distinctly large horns for the massive Boss head
                 h_base_r = hr * 0.4
                 h_top_r  = hr * 0.1
                 h_height = hr * 1.5
@@ -804,126 +1012,114 @@ class Last_Lab_Defender:
 
             glPopMatrix()
 
-            # ── Arm geometry parameters (scaled from body radius) ──────
-            # shoulder_offset: how far left/right the shoulder sits from centre
+            # ── Limb & Weapon Parameter Calculations ──────
+            # (Calculated outside gates so weapons can still reference these coordinates)
             shoulder_offset = br * 1.1
-            # shoulder_z: height of the shoulder joint on the body sphere
             shoulder_z     = br * 0.4
-            # upper-arm length mirrors protagonist's player_leg_height ratio
             upper_arm_len  = br * 1.1
-            # cylinder radii taper like the protagonist's arm
-            arm_r_top      = br * 0.22   # top (shoulder end) radius
-            arm_r_bot      = br * 0.15   # bottom (elbow end) radius
+            arm_r_top      = br * 0.22
+            arm_r_bot      = br * 0.15
             forearm_r_top  = br * 0.18
             forearm_r_bot  = br * 0.11
-            hand_r         = hr * 0.35   # hand sphere size
-
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # LEFT ARM  (negative X side, matching protagonist structure)
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-            # elbow offset (shared by both arms)
+            hand_r         = hr * 0.35
             elbow_z = -upper_arm_len * 0.65
             elbow_y = -upper_arm_len * 0.75
 
-            # --- LEFT ARM (negative X side, matching protagonist structure) ---
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # Requirement 1: Geometry Culling (Limb Render Gate)
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if self.game_level == 3:
+                # --- LEFT ARM ---
+                # Shoulder joint
+                glPushMatrix()
+                glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+                glTranslatef(-shoulder_offset, 0, shoulder_z)
+                gluSphere(gluNewQuadric(), arm_r_top * 1.2, 20, 20)
+                glPopMatrix()
 
-            # Left shoulder joint sphere
-            glPushMatrix()
-            glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
-            glTranslatef(-shoulder_offset, 0, shoulder_z)
-            gluSphere(gluNewQuadric(), arm_r_top * 1.2, 20, 20)
-            glPopMatrix()
+                # Upper-arm
+                glPushMatrix()
+                glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+                glTranslatef(-shoulder_offset, 0, shoulder_z)
+                glRotatef(90, 1, 0, 0)
+                glRotatef(45, 1, 0, 0)
+                gluCylinder(gluNewQuadric(), arm_r_top, arm_r_bot, upper_arm_len, 20, 5)
+                glPopMatrix()
 
-            # Left upper-arm cylinder (rotated to hang downward at ~45 deg)
-            glPushMatrix()
-            glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
-            glTranslatef(-shoulder_offset, 0, shoulder_z)
-            glRotatef(90, 1, 0, 0)    # point cylinder along -Y (downward)
-            glRotatef(45, 1, 0, 0)    # add 45 deg forward swing (protagonist match)
-            gluCylinder(gluNewQuadric(), arm_r_top, arm_r_bot, upper_arm_len, 20, 5)
-            glPopMatrix()
+                # Forearm
+                glPushMatrix()
+                glColor3f(cr * 0.85, cg * 0.85, cb * 0.85)
+                glTranslatef(-shoulder_offset, elbow_y, elbow_z)
+                glRotatef(90, 1, 0, 0)
+                glRotatef(-25, 1, 0, 0)
+                glRotatef(45, 0, 1, 0)
+                gluCylinder(gluNewQuadric(), forearm_r_top, forearm_r_bot, upper_arm_len, 20, 5)
+                glPopMatrix()
 
-            # Left forearm
-            glPushMatrix()
-            glColor3f(cr * 0.85, cg * 0.85, cb * 0.85)
-            glTranslatef(-shoulder_offset, elbow_y, elbow_z)
-            glRotatef(90, 1, 0, 0)
-            glRotatef(-25, 1, 0, 0)   # slight outward splay (protagonist match)
-            glRotatef(45, 0, 1, 0)    # lateral twist
-            gluCylinder(gluNewQuadric(), forearm_r_top, forearm_r_bot, upper_arm_len, 20, 5)
-            glPopMatrix()
+                # Hand
+                glPushMatrix()
+                glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)
+                glTranslatef(-shoulder_offset, elbow_y - upper_arm_len * 0.7, elbow_z - upper_arm_len * 0.5)
+                gluSphere(gluNewQuadric(), hand_r, 20, 20)
+                glPopMatrix()
 
-            # Left hand sphere at the wrist tip
-            glPushMatrix()
-            glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)
-            glTranslatef(-shoulder_offset, elbow_y - upper_arm_len * 0.7, elbow_z - upper_arm_len * 0.5)
-            gluSphere(gluNewQuadric(), hand_r, 20, 20)
-            glPopMatrix()
+                # --- RIGHT ARM ---
+                glPushMatrix()
+                glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+                glTranslatef(shoulder_offset, 0, shoulder_z)
+                gluSphere(gluNewQuadric(), arm_r_top * 1.2, 20, 20)
+                glPopMatrix()
 
-            # --- RIGHT ARM (positive X side, mirrored) ---
+                glPushMatrix()
+                glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+                glTranslatef(shoulder_offset, 0, shoulder_z)
+                glRotatef(90, 1, 0, 0)
+                glRotatef(45, 1, 0, 0)
+                gluCylinder(gluNewQuadric(), arm_r_top, arm_r_bot, upper_arm_len, 20, 5)
+                glPopMatrix()
 
-            # Right shoulder joint sphere
-            glPushMatrix()
-            glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
-            glTranslatef(shoulder_offset, 0, shoulder_z)
-            gluSphere(gluNewQuadric(), arm_r_top * 1.2, 20, 20)
-            glPopMatrix()
+                glPushMatrix()
+                glColor3f(cr * 0.85, cg * 0.85, cb * 0.85)
+                glTranslatef(shoulder_offset, elbow_y, elbow_z)
+                glRotatef(90, 1, 0, 0)
+                glRotatef(-15, 1, 0, 0)
+                glRotatef(-45, 0, 1, 0)
+                gluCylinder(gluNewQuadric(), forearm_r_top, forearm_r_bot, upper_arm_len, 20, 5)
+                glPopMatrix()
 
-            # Right upper-arm cylinder
-            glPushMatrix()
-            glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
-            glTranslatef(shoulder_offset, 0, shoulder_z)
-            glRotatef(90, 1, 0, 0)
-            glRotatef(45, 1, 0, 0)
-            gluCylinder(gluNewQuadric(), arm_r_top, arm_r_bot, upper_arm_len, 20, 5)
-            glPopMatrix()
+                glPushMatrix()
+                glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)
+                glTranslatef(shoulder_offset, elbow_y - upper_arm_len * 0.7, elbow_z - upper_arm_len * 0.5)
+                gluSphere(gluNewQuadric(), hand_r, 20, 20)
+                glPopMatrix()
 
-            # Right forearm
-            glPushMatrix()
-            glColor3f(cr * 0.85, cg * 0.85, cb * 0.85)
-            glTranslatef(shoulder_offset, elbow_y, elbow_z)
-            glRotatef(90, 1, 0, 0)
-            glRotatef(-15, 1, 0, 0)   # slightly different splay (protagonist match)
-            glRotatef(-45, 0, 1, 0)   # mirror lateral twist
-            gluCylinder(gluNewQuadric(), forearm_r_top, forearm_r_bot, upper_arm_len, 20, 5)
-            glPopMatrix()
+                # --- Requirement 3: Boss Leg Reorientation & Visibility Fix ---
+                # Adjusted dimensions for thick, sturdy pillar appearance
+                leg_len = br * 2.2
+                leg_r = br * 0.45
 
-            # Right hand sphere
-            glPushMatrix()
-            glColor3f(cr * 0.8, cg * 0.8, cb * 0.8)
-            glTranslatef(shoulder_offset, elbow_y - upper_arm_len * 0.7, elbow_z - upper_arm_len * 0.5)
-            gluSphere(gluNewQuadric(), hand_r, 20, 20)
-            glPopMatrix()
-
-            # ── Level 2 Gun Barrel (right hand, normal enemies only) ───────────
-            # Gated behind game_level >= 2 AND enemy type check so that:
-            #   • Level 1 enemies are visually unchanged.
-            #   • Special enemies (red healers) never carry a weapon.
-            if enemy['type'] == 'boss':
-                # Boss Legs
-                leg_len = br * 1.5
-                leg_r = br * 0.3
-                
                 # Left Leg
                 glPushMatrix()
                 glColor3f(cr * 0.7, cg * 0.7, cb * 0.7)
-                glTranslatef(-br * 0.5, 0, -br * 0.8)
-                glRotatef(90, 1, 0, 0)
-                gluCylinder(gluNewQuadric(), leg_r, leg_r*0.8, leg_len, 20, 5)
+                # Spaced wider apart (X-offset increased)
+                glTranslatef(-br * 0.8, 0, -br * 0.5)
+                # Corrected Rotation: 180 pitch ensures they point DOWN towards the floor
+                # Resolves the "two dots" issue caused by horizontal Y-axis alignment.
+                glRotatef(180, 1, 0, 0) 
+                gluCylinder(gluNewQuadric(), leg_r, leg_r * 0.8, leg_len, 20, 5)
                 glPopMatrix()
 
                 # Right Leg
                 glPushMatrix()
                 glColor3f(cr * 0.7, cg * 0.7, cb * 0.7)
-                glTranslatef(br * 0.5, 0, -br * 0.8)
-                glRotatef(90, 1, 0, 0)
-                gluCylinder(gluNewQuadric(), leg_r, leg_r*0.8, leg_len, 20, 5)
+                glTranslatef(br * 0.8, 0, -br * 0.5)
+                glRotatef(180, 1, 0, 0)
+                gluCylinder(gluNewQuadric(), leg_r, leg_r * 0.8, leg_len, 20, 5)
                 glPopMatrix()
-                
-                # Massive Cannon on right hand
+
+                # --- Massive Boss Cannon ---
                 cannon_base_r = hand_r * 1.5
-                cannon_tip_r = hand_r * 1.2
+                cannon_tip_r  = hand_r * 1.2
                 cannon_length = br * 2.0
                 wrist_x = shoulder_offset
                 wrist_y = elbow_y - upper_arm_len * 0.7
@@ -932,32 +1128,66 @@ class Last_Lab_Defender:
                 glPushMatrix()
                 glColor3f(0.15, 0.15, 0.15)
                 glTranslatef(wrist_x, wrist_y, wrist_z)
-                glRotatef(-90, 1, 0, 0)
+                glRotatef(-90, 1, 0, 0) # Points cannon forward (-Y)
                 gluCylinder(gluNewQuadric(), cannon_base_r, cannon_tip_r, cannon_length, 20, 5)
                 glPopMatrix()
-            elif self.game_level >= 2 and enemy['type'] != 'special':
-                # Gun barrel: a thin gluCylinder attached at the wrist tip,
-                # pointing forward (along +Y in the enemy's local space).
-                gun_base_r  = hand_r * 0.45   # matches arm taper style
-                gun_tip_r   = hand_r * 0.25
-                gun_length  = br * 1.4         # barrel extends past the hand
 
-                # Anchor at the same wrist-tip position as the right hand sphere
-                wrist_x = shoulder_offset
-                wrist_y = elbow_y - upper_arm_len * 0.7
-                wrist_z = elbow_z - upper_arm_len * 0.5
+            elif self.game_level in (1, 2):
+                # ── Symmetrical Cylinder Hands (Requirement: L1 & L2) ──────
+                # Both levels feature dual cylindrical arms that bob with the run_cycle.
+                for side in [-1, 1]:  # -1 for Left, 1 for Right
+                    glPushMatrix()
+                    glColor3f(cr * 0.9, cg * 0.9, cb * 0.9)
+                    glTranslatef(side * shoulder_offset, 0, shoulder_z)
+                    
+                    # Shoulder Joint
+                    gluSphere(gluNewQuadric(), arm_r_top * 1.2, 16, 16)
+                    
+                    # Articulated Arm Cylinder (rotated down and forward)
+                    # gluCylinder extends along +Z; we rotate to point it along -Y (forward-down)
+                    glRotatef(90, 1, 0, 0)
+                    glRotatef(30, 1, 0, 0)
+                    gluCylinder(gluNewQuadric(), arm_r_top, arm_r_bot, upper_arm_len * 0.8, 16, 5)
+                    
+                    # ── WEAPON ANCHORING (Normal enemies only) ────────────────
+                    # Weapons are strictly attached to the Right Arm (side == 1)
+                    if side == 1 and enemy['type'] != 'special':
+                        # Move to the hand position (tip of the cylinder)
+                        glTranslatef(0, 0, upper_arm_len * 0.8)
+                        
+                        if self.game_level == 1:
+                            # Requirement: Cyan Melee Baton (#05fff3)
+                            # RGB: (5, 255, 243) -> (0.02, 1.0, 0.95)
+                            glColor3f(5/255.0, 255/255.0, 243/255.0)
+                            glRotatef(-15, 1, 0, 0) # Tilt weapon forward
+                            gluCylinder(gluNewQuadric(), arm_r_bot, arm_r_bot * 0.4, br * 1.2, 16, 5)
+                            # Melee Tip
+                            glTranslatef(0, 0, br * 1.2)
+                            gluSphere(gluNewQuadric(), arm_r_bot * 0.5, 16, 16)
+                            
+                        elif self.game_level == 2:
+                            # Requirement: Re-anchored Gun Geometry
+                            e_shoe_r = br * 0.14
+                            e_leg_h = br * 1.1
+                            GUN_R, GUN_G, GUN_B = 1.0, 165/255.0, 0.0
+                            
+                            # Main barrel - aligned with the arm's downward extension
+                            glPushMatrix()
+                            glColor3f(GUN_R, GUN_G, GUN_B)
+                            glRotatef(60, 1, 0, 0) # Point barrel forward relative to arm
+                            gluCylinder(gluNewQuadric(), e_shoe_r * 1.5, e_shoe_r, e_leg_h * 2, 32, 32)
+                            glPopMatrix()
+                            
+                            # Handle - pointing back towards the palm
+                            glPushMatrix()
+                            glColor3f(GUN_R * 0.85, GUN_G * 0.85, 0.0)
+                            glRotatef(150, 1, 0, 0) 
+                            gluCylinder(gluNewQuadric(), e_shoe_r * 1.5, e_shoe_r, e_leg_h * 0.8, 32, 32)
+                            glPopMatrix()
 
-                glPushMatrix()
-                # Dark metallic grey for the weapon
-                glColor3f(0.25, 0.25, 0.28)
-                glTranslatef(wrist_x, wrist_y, wrist_z)
-                # Rotate so the cylinder points along -Y (forward direction)
-                # gluCylinder naturally points along +Z, so we rotate -90° around X
-                glRotatef(-90, 1, 0, 0)
-                gluCylinder(gluNewQuadric(), gun_base_r, gun_tip_r, gun_length, 12, 4)
-                glPopMatrix()
+                    glPopMatrix()
 
-            glPopMatrix()  # base enemy transform
+            glPopMatrix()  # End base enemy transform
 
     def update_enemy_combat(self):
 
@@ -990,6 +1220,18 @@ class Last_Lab_Defender:
                 print(f"[Boss] Fired Cannonball. Active: {len(self.cannonballs)}")
                 return
 
+            # ── LEVEL 2 ATTACK TOKEN SYSTEM (Concurrency Limit: 3) ──────────────
+            # Technical Specification: Only allow a maximum of 3 active shooters.
+            # Each active bullet in self.enemy_bullets consumes one "Attack Token".
+            # Level 3 Boss cannonballs are excluded to preserve boss intensity.
+            active_tokens = len(self.enemy_bullets)
+            max_tokens = 3
+            available_tokens = max_tokens - active_tokens
+
+            if available_tokens <= 0:
+                # 3 enemies are already shooting; bypass this firing opportunity.
+                return
+
             current_time = time.time()
             if current_time - self.enemy_volley_timer < self.volley_interval:
                 return  # Volley cooldown hasn't elapsed yet
@@ -1000,30 +1242,30 @@ class Last_Lab_Defender:
             # ── Filter to only normal enemies (special enemies never shoot) ────
             normal_enemies = [e for e in self.enemies if e['type'] == 'normal']
             if not normal_enemies:
-                return  # Nothing to fire from
+                return
 
-            # ── Select 2-3 random shooters from the pool ──────────────────────
-            # If fewer than 2 normal enemies are alive, all of them fire.
-            volley_count = random.randint(2, 3)
-            shooters = random.sample(
-                normal_enemies,
-                min(volley_count, len(normal_enemies))
-            )
+            # ── Select shooters based on token availability ───────────────────
+            # We want to fire a volley of 2-3 enemies, but we MUST NOT exceed the 3-token cap.
+            volley_target = random.randint(2, 3)
+            num_to_fire = min(volley_target, available_tokens, len(normal_enemies))
+            
+            if num_to_fire <= 0:
+                return
+
+            shooters = random.sample(normal_enemies, num_to_fire)
 
             # ── Each selected enemy fires one bullet at the player ─────────────
             px, py, _ = self.player_spawn_position
 
             for enemy in shooters:
                 ex_pos, ey_pos = enemy['x'], enemy['y']
-                # Bullet spawns at body-centre height so it visually exits the gun
                 bz = enemy['base_z']
 
-                # Normalised 2-D direction vector: enemy → player
                 shoot_dx = px - ex_pos
                 shoot_dy = py - ey_pos
                 shoot_dist = math.sqrt(shoot_dx ** 2 + shoot_dy ** 2)
 
-                if shoot_dist > 0:  # Guard against division by zero
+                if shoot_dist > 0:
                     shoot_dx /= shoot_dist
                     shoot_dy /= shoot_dist
                     self.enemy_bullets.append({
@@ -1333,10 +1575,30 @@ class Last_Lab_Defender:
                 x = move_x
                 y = move_y
             self.player_spawn_position = (x, y, z)            
-        elif key == b"d":
+        elif key == b"e":
             self.player_angle -= 5
-        elif key == b"a":
+        elif key == b"q":
             self.player_angle += 5
+        elif key == b"a":
+            dir_x = math.cos(math.radians(self.player_angle - 90))
+            dir_y = math.sin(math.radians(self.player_angle - 90))
+            right_x = -dir_y
+            right_y = dir_x
+            move_x, move_y = x+right_x*self.player_speed, y+right_y*self.player_speed
+            if (-GRID_LENGTH//2)+25<=move_x<=(GRID_LENGTH//2)-25 and (-GRID_WIDTH//2)+25<=move_y<=(GRID_WIDTH//2)-25:
+                x = move_x
+                y = move_y
+                self.player_spawn_position = (x, y, z)             
+        elif key == b"d":
+            dir_x = math.cos(math.radians(self.player_angle - 90))
+            dir_y = math.sin(math.radians(self.player_angle - 90))
+            right_x = -dir_y
+            right_y = dir_x
+            move_x, move_y = x-right_x*self.player_speed, y-right_y*self.player_speed
+            if (-GRID_LENGTH//2)+25<=move_x<=(GRID_LENGTH//2)-25 and (-GRID_WIDTH//2)+25<=move_y<=(GRID_WIDTH//2)-25:
+                x = move_x
+                y = move_y
+                self.player_spawn_position = (x, y, z)                       
         #  This part if for manually changing the level for checking the changes appearing
         # elif key == b"n":
         #     self.game_level_upgrader(False)
@@ -1394,6 +1656,11 @@ class Last_Lab_Defender:
     def game_level_upgrader(self, up = True):
         if up:
             self.game_level = self.game_level + 1 if self.game_level < 3 else self.game_level
+            
+            if self.game_level == 3:
+                # Restore original enemy speed (0.75) for the Final Boss phase
+                self.enemy_speed = 0.75
+            
             self.total_kills = 0
 
             # ── Bug Fix: Instant State Wipe on Level Up ──────────────────────
@@ -1412,6 +1679,41 @@ class Last_Lab_Defender:
         self.weapon_upgrade()
         # self.enemy_upgrade()
         glutPostRedisplay()
+
+    def level_transitions(self):
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, window_width, 0, window_height, -1, 1)
+
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+
+        glDisable(GL_DEPTH_TEST)
+        glColor3f(0,0.4,0)
+        glBegin(GL_QUADS)
+        glVertex2f(0, window_height//2 + 50)
+        glVertex2f(window_width, window_height//2+ 50)
+        glColor3f(0.2,1,0.2)        
+        glVertex2f(window_width, window_height//2 - 50)
+        glVertex2f(0, window_height//2-50)
+        glEnd()
+
+        glEnable(GL_DEPTH_TEST)
+
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        
+        # transition text
+        if self.game_level < 3:
+            transition_text =  f"Level {self.game_level} Cleared !!!!\n Next Level: {self.game_level + 1}"
+        else:
+            transition_text = f"End"
+        self.draw_text(window_width//2 - 150 , window_height//2 - 10, transition_text,GLUT_BITMAP_TIMES_ROMAN_24)
 
     def animation(self):
         glutPostRedisplay()
@@ -1452,37 +1754,36 @@ class Last_Lab_Defender:
         glLoadIdentity()
         glViewport(0, 0, window_width, window_height)
         self.setupCamera()     
-        
-        # show levels
         self.display_level()
-
-        # time functions 
         if self.game_level < 3:
-            self.time_control()
             self.display_time()
-
-        # kill count 
         self.display_kill_count()
-
-
-        # Enemy calls
-        self.spawn_enemies()
-        self.enemy_movement()
-        self.bullet_enemy_collision()
-
-        # Level 2+ enemy combat coordinator & projectile pipeline
-        self.update_enemy_combat()           # Centralised volley firing (2-3 enemies)
-        self.update_enemy_bullets()          # Advance enemy bullets each frame
-        self.enemy_bullet_player_collision() # Check if any enemy bullet hit the player
-        if self.game_level == 3:
-            self.update_cannonballs()
-            self.cannonball_collisions()
-        
-        # call the functions 
         self.draw_elements()
-        self.bullet_movement()
-
         self.draw_hud()
+
+        if not self.transition_pause:
+            if self.game_level < 3:
+                self.time_control()
+            self.spawn_enemies()
+            self.enemy_movement()
+            self.bullet_enemy_collision()
+            self.update_enemy_combat()
+            self.update_enemy_bullets()
+            self.enemy_bullet_player_collision()
+            self.bullet_movement()
+
+            if self.game_level == 3:
+                self.update_cannonballs()
+                self.cannonball_collisions()
+
+        if self.transition_pause:
+            self.level_transitions()
+            if time.time() - self.transition_start >= 3:
+                self.transition_pause = False
+                self.game_level_upgrader()
+                self.start_time = time.time()
+                self.last_spawn_time = time.time()
+                self.enemy_volley_timer = time.time()
         glutSwapBuffers()
 
 def main():
